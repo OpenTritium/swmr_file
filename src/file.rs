@@ -12,13 +12,13 @@ use tokio::{
     sync::{Mutex, RwLock},
 };
 
-pub type WritedRange = Arc<RwLock<RangeSetBlaze<usize>>>;
-pub type FlushedRange = Arc<Mutex<RangeSetBlaze<usize>>>;
+pub(crate) type WritedRange = Arc<RwLock<RangeSetBlaze<usize>>>;
+pub(crate) type SyncedRange = Arc<Mutex<RangeSetBlaze<usize>>>;
 
 struct ReadWriteFile {
     path: Utf8PathBuf,
-    writed: WritedRange,   // 存在并发读
-    flushed: FlushedRange, // 只用于持久化
+    writed: WritedRange,  // 存在并发读
+    flushed: SyncedRange, // 只用于持久化
 }
 
 struct ReadOnlyFile {

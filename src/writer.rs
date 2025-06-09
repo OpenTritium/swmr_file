@@ -1,115 +1,291 @@
-use std::{
-    io::Write, pin::Pin, sync::{atomic::{AtomicU64, AtomicUsize}, Arc}, task::{Context, Poll}
-};
-
+use crate::utils::{Obsolete, TaskState, spawn_mandatory_blocking};
 use crate::{
-    file::{FlushedRange, WritedRange},
+    file::{SyncedRange, WritedRange},
     strategy::SyncStrategy,
+    utils::{Operation, PollState, asyncify},
 };
-use futures_util::FutureExt;
+use std::io::{SeekFrom, Write};
+use std::task::{Context, Poll, ready};
+use std::{io::Seek, ops::Not, pin::Pin};
 use sync_file::SyncFile;
+use tokio::io::AsyncWrite;
 use tokio::{
-    io::AsyncWrite,
-    task::{JoinHandle, spawn_blocking},
+    io::{AsyncSeek, Error as IoError, ErrorKind as IoErrorKind, Result as IoResult},
+    sync::Mutex,
+    task::spawn_blocking,
 };
-
-#[derive(Debug)]
-pub(crate) struct Buf {
-    buf: Vec<u8>,
-    pos: usize,
-}
-
-struct Inner {
-    state: State,
-    last_write_err: Option<std::io::ErrorKind>,
-    pos: usize,
-}
-
-#[derive(Debug)]
-enum State {
-    Idle(Option<Buf>),
-    Busy(JoinHandle<(Operation, Buf)>),
-}
-
-#[derive(Debug)]
-enum Operation {
-    Read(std::io::Result<usize>),
-    Write(std::io::Result<()>),
-    Seek(std::io::Result<u64>),
-}
+use tokio_util::bytes::BytesMut;
 
 pub struct StateWriter<S: SyncStrategy> {
-    fd: Arc<SyncFile>,
+    file: SyncFile,
     writed: WritedRange,
-    flushed: FlushedRange,
-    task: Option<JoinHandle<Result<usize, std::io::Error>>>,
+    synced: SyncedRange,
     strategy: S,
-    offset:AtomicUsize,
+    inner: Mutex<PollState>,
 }
 
 impl<S: SyncStrategy> StateWriter<S> {
-    pub fn new(fd: SyncFile, strategy: S, writed: WritedRange, flushed: FlushedRange) -> Self {
-        let fd = Arc::new(fd);
-        let offset = AtomicUsize::new(fd.offset() as usize);
+    pub(super) fn new(
+        file: SyncFile,
+        strategy: S,
+        writed: WritedRange,
+        synced: SyncedRange,
+    ) -> Self {
         Self {
-            fd,
-            task: None,
+            file,
             strategy,
             writed,
-            flushed,
-            offset,
+            synced,
+            inner: Default::default(),
         }
+    }
+
+    //todo sync range
+    pub async fn sync_all(&self) -> IoResult<()> {
+        self.inner.lock().await.complete_inflight().await;
+        let file = self.file.clone();
+        asyncify(move || file.sync_all()).await
+    }
+
+    //todo sync range
+    pub async fn sync_data(&self) -> IoResult<()> {
+        self.inner.lock().await.complete_inflight().await;
+        let file = self.file.clone();
+        asyncify(move || file.sync_data()).await
+    }
+
+    /// 执行此操作后 pos 会变为 0
+    pub async fn set_len(&self, size: u64) -> IoResult<()> {
+        use Operation::*;
+        use TaskState::*;
+        let mut poll_state = self.inner.lock().await;
+        poll_state.complete_inflight().await;
+        let task_state = &mut poll_state.inner;
+        let Idle(buf) = task_state else {
+            unreachable!();
+        };
+        let mut buf = buf.take().unwrap();
+        let seek = buf.seek_compensate();
+        let mut file = self.file.clone();
+        *task_state = Busy(spawn_blocking(move || {
+            let result = if let Some(seek) = seek {
+                file.seek(seek).and_then(|_| file.set_len(size))
+            } else {
+                file.set_len(size)
+            }
+            .map(|()| 0); // the value is discarded later            
+            (Seek(result), buf)
+        }));
+        let Busy(h) = task_state else {
+            unreachable!();
+        };
+        let (op, buf) = h.await?;
+        *task_state = Idle(Some(buf));
+        let Seek(result) = op else {
+            unreachable!();
+        };
+        result.map(|pos| poll_state.pos = pos)
+    }
+
+    pub async fn metadata(&self) -> IoResult<std::fs::Metadata> {
+        let file = self.file.clone();
+        asyncify(move || file.metadata()).await
+    }
+
+    pub async fn set_permissions(&self, perm: std::fs::Permissions) -> IoResult<()> {
+        let file = self.file.clone();
+        asyncify(move || file.set_permissions(perm)).await
     }
 }
 
-impl<S: SyncStrategy> Unpin for StateWriter<S> {}
+impl<S: SyncStrategy> AsyncSeek for StateWriter<S> {
+    fn start_seek(self: Pin<&mut Self>, mut pos: SeekFrom) -> IoResult<()> {
+        use TaskState::*;
+        let this = unsafe { self.get_unchecked_mut() };
+        let poll_state = this.inner.get_mut();
+        let task_state = &mut poll_state.inner;
+        match task_state {
+            Busy(_) => Err(IoError::new(
+                IoErrorKind::Other,
+                "other file operation is pending, call poll_complete before start_seek",
+            )),
+            Idle(buf) => {
+                let mut buf = buf.take().unwrap();
+                if !buf.is_empty() {
+                    if let SeekFrom::Current(ref mut offset) = pos {
+                        *offset += buf.obsolete();
+                    }
+                }
+                let mut file = this.file.clone();
+                *task_state = Busy(spawn_blocking(move || {
+                    (Operation::Seek(file.seek(pos)), buf)
+                }));
+                Ok(())
+            }
+        }
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<u64>> {
+        let poll_state = unsafe { self.get_unchecked_mut().inner.get_mut() };
+        let task_state = &mut poll_state.inner;
+        loop {
+            use Operation::*;
+            use Poll::*;
+            use TaskState::*;
+            match task_state {
+                Idle(_) => return Ready(Ok(poll_state.pos)),
+                Busy(h) => {
+                    let (op, buf) = ready!(Pin::new(h).poll(cx))?;
+                    *task_state = Idle(Some(buf));
+                    match op {
+                        Write(Err(err)) => {
+                            debug_assert!(poll_state.last_err.is_none(), "poll_state has an error");
+                            poll_state.last_err = Some(err.kind());
+                        }
+                        Seek(result) => {
+                            if let Ok(pos) = result {
+                                poll_state.pos = pos;
+                            }
+                            return Ready(result);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
 
 impl<S: SyncStrategy> AsyncWrite for StateWriter<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &[u8],
+        src: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
-        let this = self.get_mut();
-        if let Some(fut) = this.task.as_mut() {
-            match fut.poll_unpin(cx) {
-                Poll::Ready(Ok(Ok(n))) => {
-                    let offset = this.offset.load(std::sync::atomic::Ordering::Acquire);
-                    this.writed.blocking_write().ranges_insert(offset..=(offset+n-1));
-                    
-                    this.task = None;
-                    Poll::Ready(res)
+        let this = unsafe { self.get_unchecked_mut() };
+        let poll_state = this.inner.get_mut();
+        let task_state = &mut poll_state.inner;
+        if let Some(err) = poll_state.last_err.take() {
+            return Poll::Ready(Err(err.into()));
+        }
+        loop {
+            use Operation::*;
+            use Poll::*;
+            use TaskState::*;
+            match task_state {
+                Idle(buf) => {
+                    let mut buf = buf.take().unwrap();
+                    let seek = buf.seek_compensate();
+                    buf.extend_from_slice(src);
+                    let n = buf.len();
+                    let mut file = this.file.clone();
+                    let cur_pos = poll_state.pos as usize;
+                    let writed = this.writed.clone();
+                    let h = spawn_mandatory_blocking(move || {
+                        let result = if let Some(seek) = seek {
+                            file.seek(seek).and_then(|_| {
+                                // `write_all` already ignores interrupts
+                                let result = file.write_all(&buf);
+                                buf.clear();
+                                result
+                            })
+                        } else {
+                            file.write_all(&buf)
+                        }
+                        .inspect(|_| {
+                            let rng = cur_pos..=(cur_pos + buf.len() - 1);
+                            writed.blocking_write().ranges_insert(rng);
+                        });
+                        (Write(result), buf)
+                    })
+                    .ok_or_else(|| IoError::new(IoErrorKind::Other, "background task failed"))?;
+                    *task_state = Busy(h);
+                    return Ready(Ok(n));
                 }
-                Poll::Ready(Err(e)) => {
-                    this.task = None;
-                    Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+                Busy(h) => {
+                    let (op, buf) = ready!(Pin::new(h).poll(cx))?;
+                    *task_state = Idle(Some(buf));
+                    if let Write(result) = op {
+                        result?;
+                    }
+                    continue;
                 }
-                Poll::Pending => Poll::Pending,
             }
-        } else {
-            let mut fd = this.fd.clone();
-            let owned_buf = buf.to_vec();
-            let join_handle = spawn_blocking(move || fd.write(&owned_buf));
-            this.task = Some(join_handle);
-            Pin::new(this).poll_write(cx, buf)
         }
     }
 
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-        let this = self.get_mut();
-        this.fd.flush()?;
-        std::task::Poll::Ready(Ok(()))
+    fn is_write_vectored(&self) -> bool {
+        true
     }
 
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-        let this = self.get_mut();
-        this.fd.flush()?;
-        std::task::Poll::Ready(Ok(()))
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
+        unsafe { self.get_unchecked_mut().inner.get_mut().poll_flush(cx) }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
+        self.poll_flush(cx)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<Result<usize, IoError>> {
+        use Operation::*;
+        use Poll::*;
+        use TaskState::*;
+        let this = unsafe { self.get_unchecked_mut() };
+        let poll_state = this.inner.get_mut();
+        let task_state = &mut poll_state.inner;
+        if let Some(e) = poll_state.last_err.take() {
+            return Poll::Ready(Err(e.into()));
+        }
+        loop {
+            match task_state {
+                Idle(buf) => {
+                    let mut buf = buf.take().unwrap();
+                    let seek = buf
+                        .is_empty()
+                        .not()
+                        .then(|| SeekFrom::Current(buf.obsolete()));
+                    let n = bufs.iter().map(|b| b.len()).sum::<usize>();
+                    buf.reserve(n);
+                    let mut file = this.file.clone();
+                    for b in bufs {
+                        buf.extend_from_slice(b);
+                    }
+                    let cur_pos = poll_state.pos as usize;
+                    let writed = this.writed.clone();
+                    let h = spawn_mandatory_blocking(move || {
+                        let res = if let Some(seek) = seek {
+                            file.seek(seek).and_then(|_| {
+                                // `write_all` already ignores interrupts
+                                let result = file.write_all(&buf);
+                                buf.clear();
+                                result
+                            })
+                        } else {
+                            file.write_all(&buf)
+                        }
+                        .inspect(|_| {
+                            let rng = cur_pos..=(cur_pos + buf.len() - 1);
+                            writed.blocking_write().ranges_insert(rng);
+                        });
+                        (Write(res), buf)
+                    })
+                    .ok_or_else(|| IoError::new(IoErrorKind::Other, "background task failed"))?;
+                    *task_state = Busy(h);
+                    return Ready(Ok(n));
+                }
+                Busy(h) => {
+                    let (op, buf) = ready!(Pin::new(h).poll(cx))?;
+                    *task_state = Idle(Some(buf));
+                    if let Write(result) = op {
+                        result?;
+                    }
+                    continue;
+                }
+            }
+        }
     }
 }
