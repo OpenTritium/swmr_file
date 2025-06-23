@@ -12,29 +12,39 @@ use tokio::{
     sync::{Mutex, RwLock},
 };
 
-pub(crate) type WritedRange = Arc<RwLock<RangeSetBlaze<usize>>>;
-pub(crate) type SyncedRange = Arc<Mutex<RangeSetBlaze<usize>>>;
+pub(crate) type WritedRange = Arc<RwLock<RangeSetBlaze<u64>>>;
+pub(crate) type SyncedRange = Arc<Mutex<RangeSetBlaze<u64>>>;
 
-struct ReadWriteFile {
+pub struct WriteReadFile {
     path: Utf8PathBuf,
-    writed: WritedRange,  // 存在并发读
-    flushed: SyncedRange, // 只用于持久化
+    writed: WritedRange,
+    flushed: SyncedRange, // 在停机时及时保存状态，持久化到硬盘
+}
+
+impl WriteReadFile {
+    pub fn new(path: Utf8PathBuf) -> Self {
+        Self {
+            path,
+            writed: Arc::new(RwLock::new(RangeSetBlaze::new())),
+            flushed: Arc::new(Mutex::new(RangeSetBlaze::new())),
+        }
+    }
 }
 
 struct ReadOnlyFile {
     path: Utf8PathBuf,
 }
 
-trait Writable {
-    fn get_writer(&self, strategy: impl SyncStrategy) -> impl AsyncWrite;
+pub trait Writable<S: SyncStrategy> {
+    fn get_writer(&self, strategy: S) -> StateWriter<S>;
 }
 
-trait Readable {
+pub trait Readable {
     fn get_reader(&self) -> impl AsyncRead;
 }
 
-impl Writable for ReadWriteFile {
-    fn get_writer(&self, strategy: impl SyncStrategy) -> impl AsyncWrite {
+impl<S: SyncStrategy> Writable<S> for WriteReadFile {
+    fn get_writer(&self, strategy: S) -> StateWriter<S> {
         let fd = OpenOptions::new()
             .write(true)
             .create(true)
@@ -45,7 +55,7 @@ impl Writable for ReadWriteFile {
     }
 }
 
-impl Readable for ReadWriteFile {
+impl Readable for WriteReadFile {
     fn get_reader(&self) -> impl AsyncRead {
         let fd = SyncFile::open(&self.path).unwrap();
         StateReader::new(self.writed.clone(), fd)

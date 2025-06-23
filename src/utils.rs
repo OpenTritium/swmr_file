@@ -1,14 +1,8 @@
-use std::{
-    io::SeekFrom,
-    ops::Not,
-    pin::Pin,
-    task::{Context, Poll, ready},
-};
+use crate::{file::WritedRange, poll_state::PollState};
 use tokio::{
-    io::{Error as IoError, ErrorKind as IoErrorKind, Result as IoResult},
-    task::JoinHandle,
+    io::{AsyncRead, AsyncWrite, Error as IoError, ErrorKind as IoErrorKind, Result as IoResult},
+    sync::MutexGuard,
 };
-use tokio_util::bytes::{Buf, BytesMut};
 
 pub(crate) async fn asyncify<F, T>(f: F) -> IoResult<T>
 where
@@ -20,112 +14,6 @@ where
         .unwrap_or_else(|err| Err(IoError::new(IoErrorKind::Other, err)))
 }
 
-#[derive(Debug)]
-pub(crate) enum TaskState {
-    Idle(Option<BytesMut>),
-    Busy(JoinHandle<(Operation, BytesMut)>),
-}
-
-impl Default for TaskState {
-    fn default() -> Self {
-        TaskState::Idle(Some(BytesMut::new()))
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum Operation {
-    Read(IoResult<usize>),
-    Write(IoResult<()>),
-    Seek(IoResult<u64>),
-}
-
-#[derive(Default)]
-pub(crate) struct PollState {
-    pub(crate) inner: TaskState,
-    pub(crate) last_err: Option<IoErrorKind>,
-    pub(crate) pos: u64,
-}
-
-impl PollState {
-    /// accquire poll result
-    pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
-        use Operation::*;
-        use Poll::*;
-        use TaskState::*;
-        if let Some(e) = self.last_err.take() {
-            return Ready(Err(e.into()));
-        }
-        let (op, buf) = match self.inner {
-            Idle(_) => return Ready(Ok(())),
-            Busy(ref mut h) => ready!(Pin::new(h).poll(cx))?,
-        };
-        // store the buf for later use
-        self.inner = Idle(Some(buf));
-        match op {
-            Read(_) | Seek(_) => Ready(Ok(())),
-            Write(result) => Ready(result),
-        }
-    }
-
-    /// accquire poll result, but don't care about err
-    pub(crate) fn poll_complete_inflight(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        use Poll::*;
-        match self.poll_flush(cx) {
-            Ready(Err(e)) => {
-                // just return `()`, put err back
-                self.last_err = Some(e.kind());
-                Ready(())
-            }
-            Ready(Ok(())) => Ready(()),
-            Pending => Pending,
-        }
-    }
-
-    /// convert `poll` into `future`
-    pub(crate) async fn complete_inflight(&mut self) {
-        std::future::poll_fn(|cx| self.poll_complete_inflight(cx)).await;
-    }
-}
-
-pub(crate) trait Obsolete {
-    ///clear the buf, and return discarded bytes count (negtive)
-    fn obsolete(&mut self) -> i64;
-    fn seek_compensate(&mut self) -> Option<SeekFrom>;
-}
-
-impl Obsolete for BytesMut {
-    #[inline(always)]
-    fn obsolete(&mut self) -> i64 {
-        use std::ops::Neg;
-        let n = self.len();
-        self.clear();
-        i64::try_from(n)
-            .expect("drained buf offset overflowed")
-            .neg()
-    }
-
-    #[inline(always)]
-    /// if buf is not empty, return `SeekFrom::Current(-buf.len())`
-    fn seek_compensate(&mut self) -> Option<SeekFrom> {
-        self.is_empty()
-            .not()
-            .then(|| SeekFrom::Current(self.obsolete()))
-    }
-}
-
-// async fn spawn_mandatory_blocking<F, R>(f: F) -> Option<JoinHandle<R>>
-// where
-//     F: FnOnce() -> R + Send + 'static,
-//     R: Send + 'static,
-// {
-//     let h = tokio::task::spawn_blocking(|| tokio::task::coop::unconstrained(f));
-//     if tokio::runtime::Handle::try_current().is_err() {
-//         return None; // 运行时已关闭
-//     }
-//     let h = h.await.unwrap();
-//     Some()
-// }
-
 #[inline(always)]
 pub fn spawn_mandatory_blocking<F, R>(f: F) -> Option<tokio::task::JoinHandle<R>>
 where
@@ -134,4 +22,70 @@ where
 {
     let handle = tokio::runtime::Handle::try_current().ok()?;
     Some(handle.spawn_blocking(f))
+}
+
+#[inline(always)]
+pub(crate) fn new_io_other_err(msg: &str) -> IoError {
+    IoError::new(IoErrorKind::Other, msg)
+}
+
+/// 此trait 保证同步策略，包装 AsyncRead 以实现同步读
+pub trait SyncRedable: AsyncRead {
+    async fn read_inherit(&mut self, buf: &mut [u8]) -> IoResult<usize>;
+    async fn read_to_end_inherit(&mut self, buf: &mut Vec<u8>) -> IoResult<usize>;
+    fn offset(&self) -> u64;
+    async fn get_poll_state(&'_ self) -> MutexGuard<'_, PollState>;
+    fn get_writed(&self) -> &WritedRange;
+
+    /// 获取有效字节范围读取，返回的是读取的有效字节数
+    /// 如果不交就返回未预期的结束符
+    /// 如果发生错误，记得清理脏数据
+    async fn sync_read(&mut self, mut dst: impl AsMut<[u8]>) -> IoResult<usize> {
+        self.get_poll_state().await.complete_inflight().await;
+        let start = self.offset() + 1;
+        let n = self.read_inherit(dst.as_mut()).await?;
+        let end = start + n as u64 - 1;
+        let sub = range_set_blaze::RangeSetBlaze::from_iter([start..=end]);
+        let sup = self.get_writed().read().await.clone();
+        if sup.is_disjoint(&sub) {
+            // 不相交
+            return Err(IoErrorKind::UnexpectedEof.into());
+        }
+        let its = &sub & &sup;
+        let itv = its.ranges().next().unwrap();
+        if *itv.start() != start {
+            // 中间有空洞
+            return Err(IoErrorKind::UnexpectedEof.into());
+        }
+        // 即使后面有空洞也返回空洞之前的字节数量
+        return Ok(itv.count());
+    }
+
+    /// 读到最长没有空洞的地方，注意这并不代表文件结束了，你还可以移动游标继续读取
+    async fn sync_read_to_end(&mut self, mut dst: impl AsMut<Vec<u8>>) -> IoResult<usize> {
+        self.get_poll_state().await.complete_inflight().await;
+        let start = self.offset() + 1;
+        let n = self.read_to_end_inherit(dst.as_mut()).await?;
+        let end = start + n as u64 - 1;
+        let sub = range_set_blaze::RangeSetBlaze::from_iter([start..=end]);
+        let sup = self.get_writed().read().await.clone();
+        if sup.is_disjoint(&sub) {
+            // 不相交
+            return Err(IoErrorKind::UnexpectedEof.into());
+        }
+        let its = &sub & &sup;
+        let itv = its.ranges().next().unwrap();
+        if *itv.start() != start {
+            // 中间有空洞
+            return Err(IoErrorKind::UnexpectedEof.into());
+        }
+        // 即使后面有空洞也返回空洞之前的字节数量
+        return Ok(itv.count());
+    }
+}
+
+/// 此trait 保证同步策略
+pub trait SyncWritable: AsyncWrite {
+    async fn sync_write_all(&mut self, src: impl AsRef<[u8]>) -> IoResult<()>;
+    async fn sync_write(&mut self, src: impl AsRef<[u8]>) -> IoResult<usize>;
 }

@@ -1,28 +1,25 @@
 use crate::file::{SyncedRange, WritedRange};
-use sync_file::SyncFile;
-use tracing::error;
 
 // 写完执行
-pub trait SyncStrategy: Sync + Send + 'static {
-    async fn perform(&self, writed: WritedRange, synced: SyncedRange, file: SyncFile);
+pub trait SyncStrategy: Sync + Send + 'static + Unpin {
+    #[must_use]
+    async fn should_sync(&self, writed: WritedRange, synced: SyncedRange) -> bool;
 }
 
 pub struct ThresholdSyncStrategy(u128);
 
 impl Default for ThresholdSyncStrategy {
     fn default() -> Self {
-        const THRESHOLD: u128 = 128;
+        const THRESHOLD: u128 = 0x400;
         Self(THRESHOLD)
     }
 }
 
 impl SyncStrategy for ThresholdSyncStrategy {
-    async fn perform(&self, writed: WritedRange, synced: SyncedRange, file: SyncFile) {
+    async fn should_sync(&self, writed: WritedRange, synced: SyncedRange) -> bool {
         let w = writed.read().await.clone();
         let p = synced.lock().await.clone();
-        if (w - p).len() >= self.0 {
-            let _ = file.sync_all().map_err(|err| error!("{err}"));
-        }
+        (w - p).len() >= self.0
     }
 }
 
@@ -30,16 +27,16 @@ impl SyncStrategy for ThresholdSyncStrategy {
 pub struct ImmediateSyncStrategy;
 
 impl SyncStrategy for ImmediateSyncStrategy {
-    async fn perform(&self, _: WritedRange, _: SyncedRange, file: SyncFile) {
-        let _ = file.sync_all().inspect_err(|err| error!("{err}"));
+    async fn should_sync(&self, _: WritedRange, _: SyncedRange) -> bool {
+        true
     }
 }
 
 impl<F> SyncStrategy for F
 where
-    F: (AsyncFn(WritedRange, SyncedRange, SyncFile) -> ()) + Send + Sync + 'static,
+    F: (AsyncFn(WritedRange, SyncedRange) -> bool) + Send + Sync + 'static + Unpin,
 {
-    async fn perform(&self, writed: WritedRange, synced: SyncedRange, file: SyncFile) {
-        self(writed, synced, file).await
+    async fn should_sync(&self, writed: WritedRange, synced: SyncedRange) -> bool {
+        self(writed, synced).await
     }
 }
