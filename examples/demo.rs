@@ -1,26 +1,27 @@
-use std::{io::SeekFrom, thread::park};
-
+use std::io::SeekFrom;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use worm_file::{
-    file::{Writable, WriteReadFile},
+    file::{GetWriter, WriteReadFile},
     strategy::ImmediateSyncStrategy,
+    utils::SyncWritable,
 };
 
 #[tokio::main]
 async fn main() {
-    let f = WriteReadFile::new("./a.txt".into());
+    let f = WriteReadFile::create("./Geshin Impact: Launch.txt".into()).unwrap();
     let mut w = f.get_writer(ImmediateSyncStrategy);
-    w.write_all(b"adafeaffsagfageargaergrghsgsre")
+    w.write_all("我爱玩原神，也爱写 Rust。".as_bytes())
         .await
         .unwrap();
+    println!("当前游标 {:?}", w.stream_position().await.unwrap());
     w.set_len(50).await.unwrap();
-    let mut v = vec![];
-    let result = w.seek(SeekFrom::Start(2)).await.unwrap();
     println!(
-        "seeked:{},{}",
-        result,
-        w.seek(SeekFrom::Current(0)).await.unwrap()
+        "setlen(50)  后游标的位置也不应当改变 {:?}",
+        w.stream_position().await
     );
-    w.read_to_end(&mut v).await.unwrap();
-    park();
+    w.seek(SeekFrom::Start(0)).await.unwrap();
+    let mut buf = String::new();
+    dbg!(w.read_to_string(&mut buf).await.unwrap());
+    println!("{buf}");
+    println!("当前游标 {:?}", w.stream_position().await.unwrap());
 }

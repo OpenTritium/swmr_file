@@ -20,8 +20,8 @@ impl Default for TaskState {
 
 #[derive(Debug)]
 pub(crate) enum Operation {
-    Read(IoResult<usize>),
-    Write(IoResult<()>),
+    Read(IoResult<u64>),
+    Write(IoResult<u64>), //下一次的偏移量
     Seek(IoResult<u64>),
 }
 
@@ -29,12 +29,11 @@ pub(crate) enum Operation {
 pub(crate) struct PollState {
     pub(crate) inner: TaskState,
     pub(crate) last_write_err: Option<IoErrorKind>,
-    // 仅仅是缓存值，你需要 `SeekFrom::Curretn(0)` 刷新
-    pub(crate) pos: u64,
+    pub(crate) pos: u64, // 总是指向下个待处理的位置
 }
 
 impl PollState {
-    /// accquire poll result
+    /// 获取完成状态
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
         use Operation::*;
         use Poll::*;
@@ -49,12 +48,12 @@ impl PollState {
         let (op, buf) = ready!(Pin::new(h).poll(cx))?;
         *task_state = Idle(Some(buf));
         if let Write(result) = op {
-            return Ready(result);
+            return Ready(result.map(|_| ()));
         }
         Ready(Ok(()))
     }
 
-    /// accquire poll result, but don't care about err
+    /// 获取完成这状态，即使出错了也算完成
     pub(crate) fn poll_complete_inflight(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         use Poll::*;
         match self.poll_flush(cx) {

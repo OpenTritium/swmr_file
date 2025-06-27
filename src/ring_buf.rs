@@ -1,12 +1,12 @@
 use std::io::{ErrorKind as IoErrorKind, Read, Result as IoResult, Seek};
-use sync_file::{Size, SyncFile};
+use sync_file::SyncFile;
 use tokio::io::ReadBuf;
 
 pub(crate) type RingBuffer = slice_ring_buffer::SliceRingBuffer<u8>;
 
 pub(crate) trait RingBufferExt {
     fn obsolete(&mut self) -> isize;
-    fn read_file(&mut self, src: &mut SyncFile) -> IoResult<usize>;
+    fn read_file(&mut self, src: SyncFile) -> IoResult<usize>;
     fn write_to(&mut self, dst: &mut ReadBuf<'_>) -> usize;
     fn clear_shrink(&mut self, n: usize);
     fn read_from(&mut self, src: &[u8]) -> usize;
@@ -42,7 +42,7 @@ impl RingBufferExt for RingBuffer {
     /// 此函数确保缓冲区大小在 `[MAX_BUF, src.len()]` 之间，
     /// 必须清空本缓冲区后再调用此函数，
     /// src 带有游标状态，所以每次读取 src 都是后面的新数据，为了连续读取，不要去变更 src 游标
-    fn read_file(&mut self, src: &mut SyncFile) -> IoResult<usize> {
+    fn read_file(&mut self, mut src: SyncFile) -> IoResult<usize> {
         debug_assert!(self.is_empty());
         let n = BUFFER_MAX_SIZE.min(src.stream_len()? as usize);
         self.reserve(n);
@@ -50,11 +50,7 @@ impl RingBufferExt for RingBuffer {
             let uninit = self.tail_head_slice();
             std::slice::from_raw_parts_mut(uninit.as_mut_ptr() as *mut u8, uninit.len())
         };
-        dbg!(src.offset());
-        dbg!(src.stream_len());
-        dbg!(src.size());
-        dbg!(src.stream_position());
-        let result = uninterruptibly!(dbg!(src.read(uninit)));
+        let result = uninterruptibly!(src.read(uninit));
         result
             .inspect(|&n| unsafe {
                 self.move_tail_unchecked(

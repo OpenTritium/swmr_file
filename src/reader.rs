@@ -1,6 +1,6 @@
+use crate::file::WritedRange;
 use sync_file::SyncFile;
 use tokio::io::AsyncRead;
-use crate::file::WritedRange;
 
 pub struct StateReader {
     writed: WritedRange,
