@@ -8,7 +8,8 @@ use worm_file::{
 
 #[tokio::main]
 async fn main() {
-    let f = WriteReadFile::create("./Geshin Impact: Launch.txt".into()).unwrap();
+    // 做好文件名消毒，windows 上遇到冒号就寄了
+    let f = WriteReadFile::create("./Geshin Impact.txt".into()).unwrap();
     let mut w = f.get_writer(ImmediateSyncStrategy);
     w.write_all("我爱玩原神，也爱写 Rust。".as_bytes())
         .await
