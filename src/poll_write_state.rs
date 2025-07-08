@@ -1,41 +1,21 @@
-use crate::ring_buf::RingBuffer;
+use crate::task_state::TaskState;
 use std::{
     io::{ErrorKind as IoErrorKind, Result as IoResult},
     pin::Pin,
     task::{Context, Poll, ready},
 };
-use tokio::task::JoinHandle;
-
-#[derive(Debug)]
-pub(crate) enum TaskState {
-    Idle(Option<Box<RingBuffer>>),
-    Busy(JoinHandle<(Operation, Box<RingBuffer>)>),
-}
-
-impl Default for TaskState {
-    fn default() -> Self {
-        TaskState::Idle(Some(Default::default()))
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum Operation {
-    Read(IoResult<u64>),
-    Write(IoResult<u64>), //下一次的偏移量
-    Seek(IoResult<u64>),
-}
 
 #[derive(Default)]
-pub(crate) struct PollState {
+pub struct PollWriteState {
     pub(crate) inner: TaskState,
     pub(crate) last_write_err: Option<IoErrorKind>,
     pub(crate) pos: u64, // 总是指向下个待处理的位置
 }
 
-impl PollState {
+impl PollWriteState {
     /// 获取完成状态
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
-        use Operation::*;
+        use crate::task_state::Operation::*;
         use Poll::*;
         use TaskState::*;
         let task_state = &mut self.inner;

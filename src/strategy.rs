@@ -1,17 +1,20 @@
-use crate::file::{SyncedRange, WritedRange};
+use crate::write_read_file::{SyncedRange, WritedRange};
 
-// 写完执行
 pub trait SyncStrategy: Sync + Send + 'static + Unpin {
     #[must_use]
-    async fn should_sync(&self, writed: WritedRange, synced: SyncedRange) -> bool;
+    fn should_sync(
+        &self,
+        writed: WritedRange,
+        synced: SyncedRange,
+    ) -> impl Future<Output = bool> + Send;
 }
 
 pub struct ThresholdSyncStrategy(u128);
 
 impl Default for ThresholdSyncStrategy {
     fn default() -> Self {
-        const THRESHOLD: u128 = 0x400;
-        Self(THRESHOLD)
+        const SYNC_THRESHOLD: u128 = 8 * 0x400;
+        Self(SYNC_THRESHOLD)
     }
 }
 
@@ -32,9 +35,10 @@ impl SyncStrategy for ImmediateSyncStrategy {
     }
 }
 
-impl<F> SyncStrategy for F
+impl<F, Fut> SyncStrategy for F
 where
-    F: (AsyncFn(WritedRange, SyncedRange) -> bool) + Send + Sync + 'static + Unpin,
+    Fut: Future<Output = bool> + Send,
+    F: (Fn(WritedRange, SyncedRange) -> Fut) + Send + Sync + 'static + Unpin,
 {
     async fn should_sync(&self, writed: WritedRange, synced: SyncedRange) -> bool {
         self(writed, synced).await

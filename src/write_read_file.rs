@@ -1,14 +1,16 @@
 use crate::{
-    strategy::SyncStrategy,
-    utils::{SyncReadable, SyncWritable},
-    writer::StateWriter,
+    file_opt::FileOpt, get_reader::GetReader, get_writer::GetWriter, state_reader::StateReader,
+    state_writer::StateWriter, strategy::SyncStrategy, sync_readable::SyncReadable,
+    sync_writable::SyncWritable,
 };
 use camino::Utf8PathBuf;
 use range_set_blaze::RangeSetBlaze;
-use std::{fs::OpenOptions, sync::Arc};
+use std::{fs::OpenOptions, io::Result as IoResult, sync::Arc};
 use sync_file::SyncFile;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, Result as IoResult};
-use tokio::sync::{Mutex, RwLock};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::{Mutex, RwLock},
+};
 
 pub(crate) type WritedRange = Arc<RwLock<RangeSetBlaze<u64>>>;
 pub(crate) type SyncedRange = Arc<Mutex<RangeSetBlaze<u64>>>;
@@ -54,31 +56,22 @@ impl WriteReadFile {
     }
 }
 
-struct ReadOnlyFile {
-    path: Utf8PathBuf,
-}
-
-pub trait GetWriter<S: SyncStrategy> {
-    fn get_writer(
-        &self,
-        strategy: S,
-    ) -> impl SyncWritable + AsyncWriteExt + AsyncSeekExt + AsyncReadExt + Send;
-}
-
-pub trait GetReader {
-    fn get_reader(&self) -> impl SyncReadable + AsyncReadExt + Send;
-}
-
 impl<S: SyncStrategy> GetWriter<S> for WriteReadFile {
     fn get_writer(
         &self,
         strategy: S,
-    ) -> impl SyncWritable + AsyncWriteExt + AsyncSeekExt + AsyncReadExt + Send {
+    ) -> impl SyncWritable + AsyncWriteExt + AsyncSeekExt + AsyncReadExt + FileOpt + Send {
         StateWriter::new(
             self.file.clone(),
             strategy,
             self.writed.clone(),
             self.flushed.clone(),
         )
+    }
+}
+
+impl GetReader for WriteReadFile {
+    fn get_reader(&self) -> impl SyncReadable + AsyncReadExt + AsyncSeekExt + Send {
+        StateReader::new(self.writed.clone(), self.file.clone())
     }
 }
