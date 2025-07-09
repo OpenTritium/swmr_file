@@ -1,4 +1,4 @@
-use crate::write_read_file::{SyncedRange, WritedRange};
+use super::rw_file::{SyncedRange, WritedRange};
 
 pub trait SyncStrategy: Sync + Send + 'static + Unpin {
     #[must_use]

@@ -161,12 +161,9 @@ mod tests {
         let src = mock_8m_data();
         let mut dst: Vec<u8> = Vec::with_capacity(src.len());
         unsafe { dst.set_len(src.len()) };
-
         let mut dst = ReadBuf::new(&mut dst);
         let mut buf = RingBuffer::with_capacity(BUFFER_MAX_SIZE);
         let mut offset = 0;
-
-        // 修复循环逻辑
         while offset < src.len() {
             let n = buf.read_from(&src[offset..]);
             offset += n;

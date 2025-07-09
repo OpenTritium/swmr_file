@@ -1,13 +1,15 @@
 use crate::{
     file_opt::FileOpt,
-    poll_write_state::PollWriteState,
     ring_buf::{BUFFER_MAX_SIZE, RingBufferExt},
-    strategy::SyncStrategy,
+    rw::{
+        poll_write_state::PollWriteState,
+        rw_file::{SyncedRange, WritedRange},
+        strategy::SyncStrategy,
+    },
     sync_readable::SyncReadable,
     sync_writable::SyncWritable,
     task_state::{Operation::*, TaskState::*},
     utils::{asyncify, new_io_other_err, spawn_mandatory_blocking},
-    write_read_file::{SyncedRange, WritedRange},
 };
 use std::{
     io::{Seek, SeekFrom, Write},
@@ -29,7 +31,7 @@ use tokio::{
     task::spawn_blocking,
 };
 
-pub struct StateWriter<S: SyncStrategy> {
+pub struct RwAccessor<S: SyncStrategy> {
     file: SyncFile,
     writed: WritedRange,
     synced: SyncedRange,
@@ -37,8 +39,13 @@ pub struct StateWriter<S: SyncStrategy> {
     inner: Mutex<PollWriteState>,
 }
 
-impl<S: SyncStrategy> StateWriter<S> {
-    pub fn new(file: SyncFile, strategy: S, writed: WritedRange, synced: SyncedRange) -> Self {
+impl<S: SyncStrategy> RwAccessor<S> {
+    pub(crate) fn new(
+        file: SyncFile,
+        strategy: S,
+        writed: WritedRange,
+        synced: SyncedRange,
+    ) -> Self {
         Self {
             file,
             strategy,
@@ -68,7 +75,7 @@ impl<S: SyncStrategy> StateWriter<S> {
 }
 
 /// 由于克隆后的文件游标有自己的游标，需要在后面的返回中更新用户游标
-impl<S: SyncStrategy> AsyncSeek for StateWriter<S> {
+impl<S: SyncStrategy> AsyncSeek for RwAccessor<S> {
     fn start_seek(self: Pin<&mut Self>, mut seek: SeekFrom) -> IoResult<()> {
         let this = self.get_mut();
         let poll_state = this.inner.get_mut();
@@ -126,7 +133,7 @@ impl<S: SyncStrategy> AsyncSeek for StateWriter<S> {
     }
 }
 
-impl<S: SyncStrategy> SyncWritable for StateWriter<S> {
+impl<S: SyncStrategy> SyncWritable for RwAccessor<S> {
     /// 尽可能地填满内置buf，每次调用此方法都会出发同步策略
     async fn sync_write(&mut self, src: impl AsRef<[u8]>) -> IoResult<usize> {
         let poll_state = self.inner.get_mut();
@@ -172,7 +179,7 @@ impl<S: SyncStrategy> SyncWritable for StateWriter<S> {
     }
 }
 
-impl<S: SyncStrategy> AsyncWrite for StateWriter<S> {
+impl<S: SyncStrategy> AsyncWrite for RwAccessor<S> {
     /// 文件写入后会返回当前游标的位置
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, src: &[u8]) -> Poll<IoResult<usize>> {
         let this = self.get_mut();
@@ -308,7 +315,7 @@ impl<S: SyncStrategy> AsyncWrite for StateWriter<S> {
     }
 }
 
-impl<S: SyncStrategy> AsyncRead for StateWriter<S> {
+impl<S: SyncStrategy> AsyncRead for RwAccessor<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -381,7 +388,7 @@ impl<S: SyncStrategy> AsyncRead for StateWriter<S> {
     }
 }
 
-impl<S: SyncStrategy> FileOpt for StateWriter<S> {
+impl<S: SyncStrategy> FileOpt for RwAccessor<S> {
     async fn sync_all(&self) -> IoResult<()> {
         self.sync_with(|file| file.sync_all()).await
     }
@@ -437,7 +444,7 @@ impl<S: SyncStrategy> FileOpt for StateWriter<S> {
     }
 }
 
-impl<S: SyncStrategy> SyncReadable for StateWriter<S> {
+impl<S: SyncStrategy> SyncReadable for RwAccessor<S> {
     async fn sync_read(&mut self, mut dst: impl AsMut<[u8]>) -> IoResult<usize> {
         let poll_state = self.inner.get_mut();
         poll_state.complete_inflight().await;

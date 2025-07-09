@@ -9,7 +9,7 @@ use std::{
 pub struct PollWriteState {
     pub(crate) inner: TaskState,
     pub(crate) last_write_err: Option<IoErrorKind>,
-    pub(crate) pos: u64, // 总是指向下个待处理的位置
+    pub(crate) pos: u64,
 }
 
 impl PollWriteState {
@@ -38,7 +38,6 @@ impl PollWriteState {
         use Poll::*;
         match self.poll_flush(cx) {
             Ready(Err(err)) => {
-                // just return `()`, put err back
                 self.last_write_err = Some(err.kind());
                 Ready(())
             }
